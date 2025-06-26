@@ -1,0 +1,504 @@
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 0985d8333..df2a871f7 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -453,3 +453,4 @@
+ 446	i386	landlock_restrict_self	sys_landlock_restrict_self
+ 447	i386	memfd_secret		sys_memfd_secret
+ 448	i386	process_mrelease	sys_process_mrelease
++449 i386  enable_extents  sys_enable_extents
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..821e94eb1 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,6 +370,7 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
++449	common	enable_extents  sys_enable_extents
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index b8037a46f..dc05d4083 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -313,6 +313,7 @@ static inline void addr_limit_user_check(void)
+  * include the prototypes if CONFIG_ARCH_HAS_SYSCALL_WRAPPER is enabled.
+  */
+ #ifndef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
++asmlinkage long sys_enable_extents(int toggle, int __user *num_extents, int __user *num_faults);
+ asmlinkage long sys_io_setup(unsigned nr_reqs, aio_context_t __user *ctx);
+ asmlinkage long sys_io_destroy(aio_context_t ctx);
+ asmlinkage long sys_io_submit(aio_context_t, long,
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 17a5a317f..5582b5115 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -880,8 +880,11 @@ __SYSCALL(__NR_memfd_secret, sys_memfd_secret)
+ #define __NR_process_mrelease 448
+ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
+ 
++#define __NR_enable_extents 449
++__SYSCALL(__NR_enable_extents, sys_enable_extents)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 449
++#define __NR_syscalls 450
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 8671c37f0..90f054f1d 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -36,6 +36,7 @@ asmlinkage long sys_ni_syscall(void)
+  * system calls.
+  */
+ 
++COND_SYSCALL(enable_extents);
+ COND_SYSCALL(io_setup);
+ COND_SYSCALL_COMPAT(io_setup);
+ COND_SYSCALL(io_destroy);
+diff --git a/mm/Makefile b/mm/Makefile
+index c715b0138..b6716a7c8 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -52,7 +52,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   mm_init.o percpu.o slab_common.o \
+ 			   compaction.o vmacache.o \
+ 			   interval_tree.o list_lru.o workingset.o \
+-			   prfile.o debug.o gup.o mmap_lock.o $(mmu-y)
++			   prfile.o debug.o gup.o mmap_lock.o extents.o $(mmu-y)
+ 
+ # Give 'page_alloc' its own module-parameter namespace
+ page-alloc-y := page_alloc.o
+diff --git a/mm/extents.c b/mm/extents.c
+new file mode 100644
+index 000000000..dc7567d7a
+--- /dev/null
++++ b/mm/extents.c
+@@ -0,0 +1,242 @@
++#include "extents.h"
++#include <linux/syscalls.h>
++#include <linux/sched.h>
++#include <linux/printk.h>
++#include <linux/slab.h>
++
++LIST_HEAD(extent_tree_head);
++DEFINE_SPINLOCK(extent_lock);
++int total_faults = 0;
++
++struct extent *create_extent(unsigned long start, unsigned long end,
++			     struct page_mapping *mapping)
++{
++	struct extent *ext = kmalloc(sizeof(struct extent), GFP_KERNEL);
++	if (!ext) {
++		printk(KERN_INFO "kmalloc failed\n");
++		return NULL;
++	}
++	ext->start_phys = start;
++	ext->end_phys = end;
++	INIT_LIST_HEAD(&ext->mappings);
++	list_add(&mapping->list, &ext->mappings);
++	return ext;
++}
++
++void merge_extents(struct extent *a, struct extent *b)
++{
++	if (!a || !b) {
++		printk(KERN_INFO "One of the extents was null\n");
++		return;
++	}
++	if (a->end_phys + 1 != b->start_phys &&
++	    b->end_phys + 1 != a->start_phys) {
++		printk(KERN_INFO
++		       "Extents [%lu, %lu] and [%lu, %lu] are not contiguous\n",
++		       &a->start_phys, &a->end_phys, &b->start_phys,
++		       &b->end_phys);
++		return;
++	}
++	a->start_phys =
++		a->start_phys < b->start_phys ? a->start_phys : b->start_phys;
++	a->end_phys = a->end_phys > b->end_phys ? a->end_phys : b->end_phys;
++	list_splice_tail_init(&a->mappings, &b->mappings);
++	free_extent(b);
++}
++
++void insert_extent(struct extent_tree *tree, struct extent *new_ext)
++{
++	struct rb_node **link = &tree->root.rb_node;
++	struct rb_node *parent = NULL;
++	struct extent *entry;
++
++	struct extent *e_before =
++		remove_extent_with_end(tree, new_ext->start_phys - 1);
++	struct extent *e_after =
++		remove_extent_with_start(tree, new_ext->end_phys + 1);
++
++	merge_extents(new_ext, e_before);
++	merge_extents(new_ext, e_after);
++
++	while (*link) {
++		parent = *link;
++		entry = rb_entry(parent, struct extent, node);
++
++		if (new_ext->end_phys < entry->start_phys)
++			link = &((*link)->rb_left);
++		else if (new_ext->start_phys > entry->end_phys)
++			link = &((*link)->rb_right);
++		else {
++			printk(KERN_INFO
++			       "Overlapping extent detected: [%lu, %lu] vs. [%lu, %lu]\n",
++			       &new_ext->start_phys, &new_ext->end_phys,
++			       &entry->start_phys, &entry->end_phys);
++			return;
++		}
++	}
++
++	rb_link_node(&new_ext->node, parent, link);
++	rb_insert_color(&new_ext->node, &tree->root);
++	printk(KERN_INFO "Inserted extent [%lu, %lu] into tree\n",
++	       &new_ext->start_phys, &new_ext->end_phys);
++}
++
++struct extent *remove_extent_with_end(struct extent_tree *tree,
++				      unsigned long end_phys)
++{
++	struct rb_node *node = tree->root.rb_node;
++	struct extent *entry;
++
++	while (node) {
++		entry = rb_entry(node, struct extent, node);
++
++		if (end_phys < entry->end_phys)
++			node = node->rb_left;
++		else if (end_phys > entry->end_phys)
++			node = node->rb_right;
++		else {
++			rb_erase(&entry->node, &tree->root);
++			printk(KERN_DEBUG
++			       "Removed extent [%lu, %lu] from tree\n",
++			       &entry->start_phys, &entry->end_phys);
++			return entry;
++		}
++	}
++
++	printk(KERN_DEBUG "Extent with start %lu not found for removal\n",
++	       &end_phys);
++	return NULL;
++}
++
++struct extent *remove_extent_with_start(struct extent_tree *tree,
++					unsigned long start_phys)
++{
++	struct rb_node *node = tree->root.rb_node;
++	struct extent *entry;
++
++	while (node) {
++		entry = rb_entry(node, struct extent, node);
++
++		if (start_phys < entry->start_phys)
++			node = node->rb_left;
++		else if (start_phys > entry->start_phys)
++			node = node->rb_right;
++		else {
++			rb_erase(&entry->node, &tree->root);
++			printk(KERN_DEBUG
++			       "Removed extent [%lu, %lu] from tree\n",
++			       &entry->start_phys, &entry->end_phys);
++			return entry;
++		}
++	}
++
++	printk(KERN_DEBUG "Extent with start %lu not found for removal\n",
++	       &start_phys);
++	return NULL;
++}
++
++void start_tracking_process(pid_t pid)
++{
++	spin_lock(&extent_lock);
++	if (find_extent_tree_by_pid(pid)) {
++		spin_unlock(&extent_lock);
++		return;
++	}
++	struct extent_tree *et =
++		kmalloc(sizeof(struct extent_tree), GFP_KERNEL);
++	if (!et) {
++		printk(KERN_INFO "Kmalloc failed\n");
++		spin_unlock(&extent_lock);
++		return;
++	}
++	et->pid = pid;
++	et->root = RB_ROOT;
++	list_add(&et->list, &extent_tree_head);
++	spin_unlock(&extent_lock);
++}
++
++struct extent_tree *find_extent_tree_by_pid(pid_t pid)
++{
++	struct extent_tree *et;
++	list_for_each_entry (et, &extent_tree_head, list) {
++		if (et->pid == pid)
++			return et;
++	}
++	return NULL;
++}
++
++struct page_mapping *create_page_mapping(unsigned long pfn)
++{
++	struct page_mapping *mapping =
++		kmalloc(sizeof(struct page_mapping), GFP_KERNEL);
++	if (!mapping) {
++		printk(KERN_INFO "kmalloc failed\n");
++		return NULL;
++	}
++	mapping->pfn = pfn;
++	return mapping;
++}
++
++void add_translation(pid_t pid, unsigned long pfn)
++{
++	spin_lock(&extent_lock);
++	total_faults++;
++	struct extent_tree *et = find_extent_tree_by_pid(pid);
++	if (!et) {
++		spin_unlock(&extent_lock);
++		return;
++	}
++	struct page_mapping *mapping = create_page_mapping(pfn);
++	struct extent *extent = create_extent(pfn, pfn, mapping);
++	insert_extent(et, extent);
++	spin_unlock(&extent_lock);
++}
++
++void free_page_mapping(struct page_mapping *pm)
++{
++	kfree(pm);
++}
++
++void free_extent(struct extent *ext)
++{
++	struct page_mapping *pm, *tmp;
++	list_for_each_entry_safe (pm, tmp, &ext->mappings, list) {
++		list_del(&pm->list);
++		free_page_mapping(pm);
++	}
++	kfree(ext);
++}
++
++void free_extent_tree(struct extent_tree *tree)
++{
++	struct rb_node *node = rb_first(&tree->root);
++	while (node) {
++		struct extent *ext = rb_entry(node, struct extent, node);
++		node = rb_next(node);
++		rb_erase(&ext->node, &tree->root);
++		free_extent(ext);
++	}
++}
++
++int stop_tracking_process(pid_t pid)
++{
++	spin_lock(&extent_lock);
++	struct extent_tree *et = find_extent_tree_by_pid(pid);
++	if (!et) {
++		spin_unlock(&extent_lock);
++		return -1;
++	}
++
++	int cnt = 0;
++	// we are traversing the rb tree here and it must not be changed which in the middle of it
++	struct rb_node *node = rb_first(&et->root);
++	while (node) {
++		node = rb_next(node);
++		cnt++;
++	}
++	printk(KERN_DEBUG "PID: %d had %lu extents", pid, cnt);
++	list_del(&et->list);
++	free_extent_tree(et);
++	spin_unlock(&extent_lock);
++	return cnt;
++}
+diff --git a/mm/extents.h b/mm/extents.h
+new file mode 100644
+index 000000000..d47c0f0f2
+--- /dev/null
++++ b/mm/extents.h
+@@ -0,0 +1,43 @@
++#include <linux/list.h>
++#include <linux/rbtree.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/spinlock.h>
++
++struct page_mapping {
++	unsigned long pfn;
++	struct list_head list;
++};
++
++struct extent {
++	unsigned long start_phys;
++	unsigned long end_phys;
++	struct list_head mappings;
++	struct rb_node node;
++};
++
++struct extent_tree {
++	pid_t pid;
++	struct rb_root root;
++	struct list_head list;
++};
++
++extern struct list_head extent_tree_head;
++extern spinlock_t extent_lock;
++extern int total_faults;
++
++struct extent *create_extent(unsigned long start, unsigned long end,
++			     struct page_mapping *mappings);
++void free_extent(struct extent *);
++void merge_extents(struct extent *a, struct extent *b);
++void insert_extent(struct extent_tree *tree, struct extent *new_ext);
++struct extent *remove_extent_with_start(struct extent_tree *tree,
++					unsigned long start_phys);
++struct extent *remove_extent_with_end(struct extent_tree *tree,
++				      unsigned long end_phys);
++void start_tracking_process(pid_t pid);
++struct extent_tree *find_extent_tree_by_pid(pid_t pid);
++struct page_mapping *create_page_mapping(unsigned long pfn);
++void free_page_mapping(struct page_mapping *pm);
++void add_translation(pid_t pid, unsigned long pfn);
++int stop_tracking_process(pid_t pid);
+diff --git a/mm/memory.c b/mm/memory.c
+index 8fb2ff757..884f11d75 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -73,6 +73,7 @@
+ #include <linux/perf_event.h>
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
++#include <linux/printk.h>
+ 
+ #include <trace/events/kmem.h>
+ 
+@@ -82,9 +83,11 @@
+ #include <linux/uaccess.h>
+ #include <asm/tlb.h>
+ #include <asm/tlbflush.h>
++#include <asm/pgtable.h>
+ 
+ #include "pgalloc-track.h"
+ #include "internal.h"
++#include "extents.h"
+ 
+ #if defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS) && !defined(CONFIG_COMPILE_TEST)
+ #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
+@@ -3875,6 +3878,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+ 	page_add_new_anon_rmap(page, vma, vmf->address, false);
+ 	lru_cache_add_inactive_or_unevictable(page, vma);
++	add_translation(current->pid, pte_pfn(entry));
+ setpte:
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 47efa8b60..d84818f05 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -57,6 +57,7 @@
+ #include <trace/events/mmap.h>
+ 
+ #include "internal.h"
++#include "extents.h"
+ 
+ #ifndef arch_mmap_check
+ #define arch_mmap_check(addr, len, flags)	(0)
+@@ -1634,6 +1635,23 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff);
+ }
+ 
++SYSCALL_DEFINE3(enable_extents, int, toggle, int __user *, num_extents, int __user *, num_faults)
++{
++	int res;
++	if (toggle) {
++		start_tracking_process(current->pid);
++		res = -1;
++	}
++	else {
++		res = stop_tracking_process(current->pid);
++	}
++	if (copy_to_user(num_extents, &res, sizeof(int)))
++		return -EFAULT;
++	if (copy_to_user(num_faults, &total_faults, sizeof(int)))
++		return -EFAULT;
++	return 0;
++}
++
+ #ifdef __ARCH_WANT_SYS_OLD_MMAP
+ struct mmap_arg_struct {
+ 	unsigned long addr;
+diff --git a/project1/test b/project1/test
+new file mode 100755
+index 000000000..3834b23ad
+Binary files /dev/null and b/project1/test differ
+diff --git a/project1/test.c b/project1/test.c
+new file mode 100644
+index 000000000..f390966e5
+--- /dev/null
++++ b/project1/test.c
+@@ -0,0 +1,54 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <string.h>
++#include <errno.h>
++#include <stdint.h>
++#include <sys/time.h>
++
++#define SYS_enable_extents 449
++
++int main()
++{
++	struct timeval start, end;
++	long duration_us;
++
++	unsigned int size = 10000 * 4096;
++	char *ptr;
++
++	pid_t pid = getpid();
++	printf("PID in user land: %d\n", pid);
++	int num_extents;
++	int num_faults;
++	if (syscall(SYS_enable_extents, 1, &num_extents, &num_faults) == -1)
++		printf("%s\n", strerror(errno));
++
++	gettimeofday(&start, NULL);
++	ptr = malloc(size);
++	for (int i = 0; i < size; i++) {
++		ptr[i] = 0;
++	}
++	free(ptr);
++	gettimeofday(&end, NULL);
++	duration_us = (end.tv_sec - start.tv_sec) * 1e6 + (end.tv_usec - start.tv_usec);
++	printf("Runtime with extents in microseconds: %ld\n", duration_us);
++
++	if (syscall(SYS_enable_extents, 0, &num_extents, &num_faults) == -1)
++		printf("%s\n", strerror(errno));
++	printf("Total number of extents tracked: %d\n", num_extents);
++	printf("Total number of anonymous page faults %d\n", num_faults);
++	
++	gettimeofday(&start, NULL);
++	ptr = malloc(size);
++	for (int i = 0; i < size; i++) {
++		ptr[i] = 0;
++	}
++	free(ptr);
++	gettimeofday(&end, NULL);
++	duration_us = (end.tv_sec - start.tv_sec) * 1e6 + (end.tv_usec - start.tv_usec);
++	printf("Runtime without extents in microseconds: %ld\n", duration_us);
++
++	return 0;
++}
