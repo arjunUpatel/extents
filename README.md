@@ -17,8 +17,8 @@ The patch of all changes is available in `mm.patch`
 
 ## scheduler
 The goal here was to implement cooperative scheduling without simply calling `yield`, thus forcing the understanding of the internals of the scheduler. This was done in two ways by registering syscalls to:
-1. Add a penalty to the `vruntime` of selected tasks. The oenalty could then be disabled with another syscall
-2. Put selected threads onto kernel wait queues by safely removing the corresponding `task_struct` from CPU runqueues. These tasks could then be returned to corresponding runqueues with another syscall
+1. Add a penalty to the `vruntime` of selected tasks. The oenalty could then be disabled with another syscall. Check out `vruntime.patch`
+2. Put selected threads onto kernel wait queues by safely removing the corresponding `task_struct` from CPU runqueues. These tasks could then be returned to corresponding runqueues with another syscall. Check out `waitq.patch`
 
 ## other interesting stuff
 - The implementation of kernel data structures is unorthodox and genius at the same time. The thing that fascinated me the most was the `container_of` macro
