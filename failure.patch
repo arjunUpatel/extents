@@ -1,0 +1,327 @@
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 0985d8333..97b6336a0 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -453,3 +453,4 @@
+ 446	i386	landlock_restrict_self	sys_landlock_restrict_self
+ 447	i386	memfd_secret		sys_memfd_secret
+ 448	i386	process_mrelease	sys_process_mrelease
++449 i386  set_process_inactive  sys_set_process_inactive
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..898e08665 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,6 +370,7 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
++449	common	set_process_inactive  sys_set_process_inactive
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index b8037a46f..77a876616 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -313,6 +313,7 @@ static inline void addr_limit_user_check(void)
+  * include the prototypes if CONFIG_ARCH_HAS_SYSCALL_WRAPPER is enabled.
+  */
+ #ifndef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
++asmlinkage long sys_set_process_inactive(pid_t pid);
+ asmlinkage long sys_io_setup(unsigned nr_reqs, aio_context_t __user *ctx);
+ asmlinkage long sys_io_destroy(aio_context_t ctx);
+ asmlinkage long sys_io_submit(aio_context_t, long,
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 17a5a317f..4fb330132 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -880,8 +880,11 @@ __SYSCALL(__NR_memfd_secret, sys_memfd_secret)
+ #define __NR_process_mrelease 448
+ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
+ 
++#define __NR_set_process_inactive 449
++__SYSCALL(__NR_set_process_inactive, sys_set_process_inactive)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 449
++#define __NR_syscalls 450
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 74ef3d8f4..587f3b335 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -45,6 +45,8 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+ 
++static DECLARE_SWAIT_QUEUE_HEAD(inactive_queue);
++
+ #ifdef CONFIG_SCHED_DEBUG
+ /*
+  * Debugging: various feature bits
+@@ -7069,6 +7071,134 @@ SYSCALL_DEFINE1(nice, int, increment)
+ 
+ #endif
+ 
++/**
++ * find_process_by_pid - find a process with a matching PID value.
++ * @pid: the pid in question.
++ *
++ * The task of @pid, if found. %NULL otherwise.
++ */
++static struct task_struct *find_process_by_pid(pid_t pid)
++{
++	return pid ? find_task_by_vpid(pid) : current;
++}
++
++// void swait_current(struct swait_queue_head *q) {
++// 	struct swait_queue wait;
++// 	INIT_LIST_HEAD(&wait.list_head);
++// 	long a = prepare_to_swait_event(q, &wait, TASK_UNINTERRUPTIBLE);
++// 	if (__wait_is_interruptible(state) && a)
++
++// 	schedule();
++// }
++
++#define swait_current(wq)			\
++({									\
++	__label__ __out;						\
++	struct swait_queue *__wait;					\
++	__wait = kzalloc(sizeof(struct swait_queue), GFP_KERNEL);\
++	long __ret = 0;						\
++	if (!__wait) {\
++		__ret = 1;\
++		goto __out;\
++	}\
++									\
++	INIT_LIST_HEAD(&__wait->task_list);				\
++	long __int = prepare_to_swait_event(&wq, __wait, TASK_UNINTERRUPTIBLE);\
++	get_task_struct(task);\
++								\
++	if (___wait_is_interruptible(TASK_UNINTERRUPTIBLE) && __int) {		\
++		__ret = __int;					\
++		goto __out;					\
++	}							\
++	schedule();							\
++__out:	__ret;								\
++})
++
++// we have already made sure that the task is in a unint sleep
++void swait_task(struct swait_queue_head *q, struct task_struct *task) {
++	// initialize swait_queue structures
++	struct swait_queue *wait;
++	unsigned long flags;
++
++	wait = kzalloc(sizeof(struct swait_queue), GFP_KERNEL);
++	if (!wait)
++		return;
++	INIT_LIST_HEAD(&wait->task_list);
++	wait->task = task;
++	get_task_struct(task);
++
++	// make sure the task is not on a runqueue
++	while (!wait_task_inactive(task, TASK_UNINTERRUPTIBLE))
++		cpu_relax();
++	
++	// add it to the wait_queue
++	raw_spin_lock_irqsave(&q->lock, flags);
++	list_add_tail(&wait->task_list, &q->task_list);
++	raw_spin_unlock_irqrestore(&q->lock, flags);
++}
++
++void finish_swait_task(struct swait_queue_head *q, struct task_struct *task) {
++	struct swait_queue *curr, *tmp;
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&q->lock, flags);
++	list_for_each_entry_safe(curr, tmp, &q->task_list, task_list) {
++		if (curr->task == task) {
++			list_del_init(&curr->task_list);
++
++			/* Wake up the task if it's still blocked */
++			// check correctness of this
++			wake_up_process(task);
++
++			// update reference count
++			put_task_struct(task);
++			kfree(curr);
++			break;
++		}
++	}
++	raw_spin_unlock_irqrestore(&q->lock, flags);
++}
++
++SYSCALL_DEFINE1(set_process_inactive, pid_t, pid)
++{
++	// task_struct corresponding given pid
++	struct task_struct *task;
++	rcu_read_lock();
++	task = find_task_by_vpid(pid);
++	if (!task) {
++		rcu_read_unlock();
++		printk(KERN_DEBUG "Corresponding PID struct not found\n");
++		return -1;
++	}
++	get_task_struct(task);
++	rcu_read_unlock();
++	printk(KERN_DEBUG "Printing stuff for verification %d %d", task->cpu, task->prio);
++	// if (task == current) {
++	// 	int ret = swait_current(inactive_queue);
++	// 	if (ret != 0) {
++	// 		printk(KERN_DEBUG "The processes did not go to sleep\n");
++	// 	}
++	// } else {
++		// now we know that the target task is not queued and its state has been set
++	// swait_task(&inactive_queue, task);
++	put_task_struct(task);
++	return 0;
++}
++
++// SYSCALL_DEFINE1(set_process_active, pid_t, pid) {
++// 	struct task_struct *task = find_process_by_pid(pid);
++// 	if (!task) {
++// 		printk(KERN_DEBUG "Corresponding PID struct not found\n");
++// 		return -1;
++// 	}
++// 	get_task_struct(task);
++// 	if (current == task)
++// 		return -1;
++// 	finish_swait_task(&inactive_queue, task);
++// 	put_task_struct(task);
++// 	return 0;
++// }
++
+ /**
+  * task_prio - return the priority value of a given task.
+  * @p: the task in question.
+@@ -7252,17 +7382,6 @@ unsigned long sched_cpu_util(int cpu, unsigned long max)
+ }
+ #endif /* CONFIG_SMP */
+ 
+-/**
+- * find_process_by_pid - find a process with a matching PID value.
+- * @pid: the pid in question.
+- *
+- * The task of @pid, if found. %NULL otherwise.
+- */
+-static struct task_struct *find_process_by_pid(pid_t pid)
+-{
+-	return pid ? find_task_by_vpid(pid) : current;
+-}
+-
+ /*
+  * sched_setparam() passes in -1 for its policy, to let the functions
+  * it calls know not to change it.
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 8671c37f0..e7de63c53 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -36,6 +36,7 @@ asmlinkage long sys_ni_syscall(void)
+  * system calls.
+  */
+ 
++COND_SYSCALL(set_process_inactive);
+ COND_SYSCALL(io_setup);
+ COND_SYSCALL_COMPAT(io_setup);
+ COND_SYSCALL(io_destroy);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 47efa8b60..8376d75c2 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1634,6 +1634,7 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff);
+ }
+ 
++
+ #ifdef __ARCH_WANT_SYS_OLD_MMAP
+ struct mmap_arg_struct {
+ 	unsigned long addr;
+diff --git a/test-pthreads.c b/test-pthreads.c
+new file mode 100644
+index 000000000..cbbc29f65
+--- /dev/null
++++ b/test-pthreads.c
+@@ -0,0 +1,53 @@
++#define _GNU_SOURCE
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <errno.h>
++#include <string.h>
++
++#define NUM_THREADS 1
++#define SYS_set_process_inactive 449
++
++pid_t tids[NUM_THREADS];
++pthread_barrier_t barrier;
++
++void *thread_fn(void *arg) {
++    long i = (long)arg;
++    tids[i] = gettid();
++    pthread_barrier_wait(&barrier);
++    printf("Thread %ld tid = %d\n", i, gettid());
++    return NULL;
++}
++
++int main() {
++    pthread_t threads[NUM_THREADS];
++    printf("Main tid: %d\n", gettid());
++    pthread_barrier_init(&barrier, NULL, NUM_THREADS + 1);
++
++    for (long i = 0; i < NUM_THREADS; i++) {
++        if (pthread_create(&threads[i], NULL, thread_fn, (void *)i))
++            exit(1);
++    }
++
++    pthread_barrier_wait(&barrier);
++    sleep(1);
++    for (int i = 0; i < NUM_THREADS; i++) {
++        printf("%d\n", tids[i]);
++    }
++    long ret;
++    ret = syscall(SYS_set_process_inactive, gettid()); // calling gettid() works fine but not tids[0]
++    if (ret < 0) {
++        printf("%s\n", strerror(errno));
++        perror("syscall failed\n");
++    } else {
++        printf("syscall success\n");
++    }
++
++    for (int i = 0; i < NUM_THREADS; i++)
++        pthread_join(threads[i], NULL);
++
++    pthread_barrier_destroy(&barrier);
++    return 0;
++}
+diff --git a/test.c b/test.c
+new file mode 100644
+index 000000000..c7f1a1b00
+--- /dev/null
++++ b/test.c
+@@ -0,0 +1,22 @@
++#define _GNU_SOURCE
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/syscall.h>
++#include <string.h>
++#include <errno.h>
++#include <stdint.h>
++
++#define SYS_set_process_inactive 449
++
++int main()
++{
++	pid_t pid = gettid();
++	printf("TID in user land: %d\n", pid);
++	if (syscall(SYS_set_process_inactive, 0) == -1)
++		printf("%s\n", strerror(errno));
++	else
++		printf("Woohoo, this ran\n");
++	return 0;
++}
++

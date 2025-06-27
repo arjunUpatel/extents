@@ -1,0 +1,209 @@
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 0985d8333..97b6336a0 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -453,3 +453,4 @@
+ 446	i386	landlock_restrict_self	sys_landlock_restrict_self
+ 447	i386	memfd_secret		sys_memfd_secret
+ 448	i386	process_mrelease	sys_process_mrelease
++449 i386  set_process_inactive  sys_set_process_inactive
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..898e08665 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,6 +370,7 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
++449	common	set_process_inactive  sys_set_process_inactive
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/benchmark.c b/benchmark.c
+new file mode 100644
+index 000000000..04b2750e5
+--- /dev/null
++++ b/benchmark.c
+@@ -0,0 +1,42 @@
++#define _GNU_SOURCE
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/time.h>
++#include <sys/syscall.h>
++#include <errno.h>
++
++#define SYS_set_process_inactive 449
++
++void *worker(void *arg) {
++  while(1);
++  return NULL;
++}
++
++int main(void) {
++  unsigned long penalty = 1000000;
++  int ret = syscall(SYS_set_process_inactive, penalty);
++  if (ret < 0) {
++    printf("syscall failed\n");
++    return 0;
++  }
++  int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
++  if (num_workers < 1)
++    return 1;
++
++  struct timeval start, end;
++  double elapsed;
++
++  pthread_t *threads = malloc(num_workers * sizeof(pthread_t));
++
++  for (int i = 0; i < num_workers; i++) {
++    if (pthread_create(&threads[i], NULL, worker, NULL) != 0)
++      return 1;
++  }
++  for (int i = 0; i < num_workers; i++)
++    pthread_join(threads[i], NULL);
++  free(threads);
++  return 0;
++}
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index b8037a46f..296111c6f 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -313,6 +313,7 @@ static inline void addr_limit_user_check(void)
+  * include the prototypes if CONFIG_ARCH_HAS_SYSCALL_WRAPPER is enabled.
+  */
+ #ifndef CONFIG_ARCH_HAS_SYSCALL_WRAPPER
++asmlinkage long sys_set_process_inactive(u64 penalty);
+ asmlinkage long sys_io_setup(unsigned nr_reqs, aio_context_t __user *ctx);
+ asmlinkage long sys_io_destroy(aio_context_t ctx);
+ asmlinkage long sys_io_submit(aio_context_t, long,
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 17a5a317f..4fb330132 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -880,8 +880,11 @@ __SYSCALL(__NR_memfd_secret, sys_memfd_secret)
+ #define __NR_process_mrelease 448
+ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
+ 
++#define __NR_set_process_inactive 449
++__SYSCALL(__NR_set_process_inactive, sys_set_process_inactive)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 449
++#define __NR_syscalls 450
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 74ef3d8f4..c51265336 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -45,6 +45,9 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+ 
++LIST_HEAD(inactive_tgid_list);
++DEFINE_SPINLOCK(inactive_tgid_lock);
++
+ #ifdef CONFIG_SCHED_DEBUG
+ /*
+  * Debugging: various feature bits
+@@ -7263,6 +7266,32 @@ static struct task_struct *find_process_by_pid(pid_t pid)
+ 	return pid ? find_task_by_vpid(pid) : current;
+ }
+ 
++SYSCALL_DEFINE1(set_process_inactive, u64, penalty)
++{
++	struct inactive_tgid *entry;
++	unsigned long flags;
++	spin_lock_irqsave(&inactive_tgid_lock, flags);
++
++	list_for_each_entry(entry, &inactive_tgid_list, list) {
++		if (entry->tgid == current->tgid) {
++			spin_unlock_irqrestore(&inactive_tgid_lock, flags);
++			return 0;
++		}
++	}
++	entry = kmalloc(sizeof(struct inactive_tgid), GFP_ATOMIC);
++	if (!entry) {
++			spin_unlock_irqrestore(&inactive_tgid_lock, flags);
++			return -ENOMEM;
++	}
++	entry->tgid = current->tgid;
++	entry->penalty = penalty;
++	INIT_LIST_HEAD(&entry->list);
++	list_add(&entry->list, &inactive_tgid_list);
++
++	spin_unlock_irqrestore(&inactive_tgid_lock, flags);
++	return 0;
++}
++
+ /*
+  * sched_setparam() passes in -1 for its policy, to let the functions
+  * it calls know not to change it.
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index e7cd7c148..ffb3e0cfc 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -848,7 +848,20 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	curr->sum_exec_runtime += delta_exec;
+ 	schedstat_add(cfs_rq->exec_clock, delta_exec);
+ 
+-	curr->vruntime += calc_delta_fair(delta_exec, curr);
++	unsigned long flags;
++	struct inactive_tgid *entry;
++	struct task_struct *task = container_of(curr, struct task_struct, se);
++	u64 penalty = 0;
++
++	spin_lock_irqsave(&inactive_tgid_lock, flags);
++	list_for_each_entry(entry, &inactive_tgid_list, list) {
++		if (entry->tgid == task->tgid) {
++			penalty = entry->penalty;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&inactive_tgid_lock, flags);
++	curr->vruntime += calc_delta_fair(delta_exec, curr) + penalty;
+ 	update_min_vruntime(cfs_rq);
+ 
+ 	if (entity_is_task(curr)) {
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 519a9343a..1ce2956b3 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -88,12 +88,21 @@
+ struct rq;
+ struct cpuidle_state;
+ 
++struct inactive_tgid {
++	pid_t tgid;
++	u64 penalty;
++	struct list_head list;
++};
++
+ /* task_struct::on_rq states: */
+ #define TASK_ON_RQ_QUEUED	1
+ #define TASK_ON_RQ_MIGRATING	2
+ 
+ extern __read_mostly int scheduler_running;
+ 
++extern struct list_head inactive_tgid_list;
++extern spinlock_t inactive_tgid_lock;
++
+ extern unsigned long calc_load_update;
+ extern atomic_long_t calc_load_tasks;
+ 
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index 8671c37f0..e7de63c53 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -36,6 +36,7 @@ asmlinkage long sys_ni_syscall(void)
+  * system calls.
+  */
+ 
++COND_SYSCALL(set_process_inactive);
+ COND_SYSCALL(io_setup);
+ COND_SYSCALL_COMPAT(io_setup);
+ COND_SYSCALL(io_destroy);
