@@ -1,4 +1,4 @@
-# kernl-hax
+# kernel-hax
 My journey into the Linux kernel.
 
 ## the what?
@@ -15,8 +15,9 @@ The patch of all changes is available in `mm.patch`
       - The freed up space in the TLB and the software based management of page faults of pages which are contiguous allows for reduced traversals of the page table and more TLB hits of pages that would otherwise not be in the TLB
 - Measured the feasibility of pruning TLB translations under different workloads
 ## scheduler
-The goal here was to implement a form of cooperative scheduling 
-- talk about both the approaches and what you learned about in each one
+The goal here was to implement cooperative scheduling without simply calling `yield`, thus forcing the understanding of the internals of the scheduler. This was done in two ways by registering syscalls to:
+1. Add a penalty to the `vruntime` of selected tasks. The oenalty could then be disabled with another syscall
+2. Put selected threads onto kernel wait queues by safely removing the corresponding `task_struct` from CPU runqueues. These tasks could then be returned to corresponding runqueues with another syscall
 
 ## other interesting stuff
 - talk about the papers you read, syscall integration, ssafely copying pointers from userland
